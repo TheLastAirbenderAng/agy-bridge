@@ -1,5 +1,6 @@
 import path from "node:path";
 import { z } from "zod";
+import { REVIEW_JSON_INSTRUCTION } from "./review-output.js";
 
 const OUTPUT_RULES =
   "Answer directly with no preamble or closing remarks. Be thorough but concise. " +
@@ -11,21 +12,22 @@ export function resolveFiles(files: string[], cwd: string): string[] {
 
 /**
  * Shared adversarial-review prompt framing for `adversarial_review` and
- * `pre_finish_review`. Both tools gather content/files + an optional focus and
- * ask for a severity-ranked flaw list (mirrors agy-run.sh cmd_review framing).
+ * `pre_finish_review`. Pure: builds the prompt from already-resolved content.
+ * The git-collection decision (when neither `content` nor `files` is given)
+ * happens in the server handler, which calls this with the collected diff.
  */
-function buildReviewPrompt(
+export function buildReviewPrompt(
   args: Record<string, unknown>,
   cwd: string,
   toolName = "adversarial_review",
 ): string {
   const files = args.files as string[] | undefined;
-  const content = args.content as string | undefined;
-  if (!content && !files?.length) {
-    throw new Error(`${toolName} requires either \`content\` or \`files\`.`);
+  const inlineContent = args.content as string | undefined;
+  if (!inlineContent && !files?.length) {
+    throw new Error(`${toolName} requires \`content\`, \`files\`, or a git scope/base.`);
   }
-  const subject = content
-    ? `Review the following:\n\n${content}`
+  const subject = inlineContent
+    ? `Review the following:\n\n${inlineContent}`
     : `Read and review these files:\n${resolveFiles(files!, cwd)
         .map((f) => `- ${f}`)
         .join("\n")}`;
@@ -34,7 +36,35 @@ function buildReviewPrompt(
     `You are an adversarial reviewer. Find real flaws: bugs, edge cases, security issues, ` +
     `performance traps, unstated assumptions, and simpler alternatives.${focus}\n\n${subject}\n\n` +
     `Rank findings by severity (critical/major/minor) and justify each. ` +
-    `Do not pad with praise or restate the input. ${OUTPUT_RULES}`
+    `Do not pad with praise or restate the input. ${OUTPUT_RULES}\n\n${REVIEW_JSON_INSTRUCTION}`
+  );
+}
+
+/**
+ * Build a review prompt from git-collected context (Workstream A). Used by the
+ * server handler when the caller passes neither `content` nor `files` — the
+ * review then targets the working-tree or branch diff.
+ */
+export function buildGitReviewPrompt(
+  ctx: {
+    content: string;
+    summary: string;
+    inputMode: "inline-diff" | "self-collect";
+    target: { label: string };
+  },
+  args: Record<string, unknown>,
+): string {
+  const focus = args.focus ? `\nFocus especially on: ${args.focus}.` : "";
+  const selfCollectNote =
+    ctx.inputMode === "self-collect"
+      ? "The diff is large and was omitted — run your own read-only git commands (git diff, git log) to inspect the changes before reviewing.\n\n"
+      : "";
+  return (
+    `You are an adversarial reviewer. Review the following git changes (${ctx.target.label}). ` +
+    `Find real flaws: bugs, edge cases, security issues, performance traps, unstated assumptions, ` +
+    `and simpler alternatives.${focus}\n\n${selfCollectNote}${ctx.summary}\n\n${ctx.content}\n\n` +
+    `Rank findings by severity (critical/major/minor) and justify each. ` +
+    `Do not pad with praise or restate the input. ${OUTPUT_RULES}\n\n${REVIEW_JSON_INSTRUCTION}`
   );
 }
 
@@ -101,6 +131,30 @@ const writeShape = {
     .describe(
       "Only for delegate. true = agy may edit files (sandbox off, permissions auto-approved). " +
         "false = read-only (sandbox on). Default follows AGY_SANDBOX / the explicit `sandbox` arg.",
+    ),
+};
+
+/**
+ * Git review scoping (Workstream A). Added to adversarial_review and
+ * pre_finish_review. When the caller passes neither `content` nor `files`,
+ * the handler auto-collects a git diff: scope controls whether that's the
+ * working tree or the current branch vs the default branch.
+ */
+const reviewShape = {
+  scope: z
+    .enum(["auto", "working-tree", "branch"])
+    .optional()
+    .describe(
+      "When reviewing git changes (no inline content/files): 'auto' picks the working tree if " +
+        "dirty, else the branch vs default; 'working-tree' reviews uncommitted changes; 'branch' " +
+        "reviews the current branch against the detected default branch (main/master/trunk).",
+    ),
+  base: z
+    .string()
+    .optional()
+    .describe(
+      "Explicit git base ref for branch-scope review (e.g. 'main', 'origin/dev', a commit sha). " +
+        "Overrides branch detection.",
     ),
 };
 
@@ -197,7 +251,10 @@ export const TOOLS: ToolDef[] = [
     description:
       "Get an adversarial second opinion from a different model family (Gemini Pro). " +
       "ALWAYS use this for plan critiques, design reviews, and pre-merge code review: " +
-      "it hunts for flaws, edge cases, security issues, and unstated assumptions you may have missed.",
+      "it hunts for flaws, edge cases, security issues, and unstated assumptions you may have missed. " +
+      "Pass `content` (inline) or `files` (paths) to review specific text; OR pass neither plus a " +
+      "`scope`/`base` to auto-review the current git diff (working-tree or branch). Returns a " +
+      "structured severity-ranked finding list (parsed JSON) plus the full prose review.",
     schema: {
       content: z
         .string()
@@ -208,6 +265,7 @@ export const TOOLS: ToolDef[] = [
         .optional()
         .describe("File paths to review instead of inline content."),
       focus: z.string().optional().describe("Optional focus area, e.g. 'security', 'concurrency'."),
+      ...reviewShape,
       ...commonShape,
       ...sandboxShape,
     },
@@ -222,9 +280,10 @@ export const TOOLS: ToolDef[] = [
       "complete. ALWAYS call this tool before you report a task as done / fixed / passing: it " +
       "hunts for bugs, edge cases, security issues, performance traps, and unstated assumptions " +
       "that a second model family catches and you may have missed. Pass `content` (inline " +
-      "diff/plan/code/snippet) or `files` (paths to review), plus an optional `focus`. Returns " +
-      "findings as TEXT — advisory and NON-blocking; weigh them with judgement, they do not gate " +
-      "completion.",
+      "diff/plan/code/snippet) or `files` (paths to review), plus an optional `focus`; OR pass " +
+      "neither plus a `scope`/`base` to auto-review the current git diff. Returns findings as a " +
+      "structured severity-ranked list (parsed JSON) plus the full prose review — advisory and " +
+      "NON-blocking; weigh them with judgement, they do not gate completion.",
     schema: {
       content: z
         .string()
@@ -235,6 +294,7 @@ export const TOOLS: ToolDef[] = [
         .optional()
         .describe("File paths to review instead of inline content."),
       focus: z.string().optional().describe("Optional focus area, e.g. 'security', 'concurrency'."),
+      ...reviewShape,
       ...commonShape,
       ...sandboxShape,
     },

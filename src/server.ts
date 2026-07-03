@@ -6,6 +6,8 @@ import path from "node:path";
 import { z } from "zod";
 import { loadConfig, type Config } from "./config.js";
 import { ModelRegistry, resolveModelAlias } from "./models.js";
+import { collectReviewContext, defaultGitExec, type GitExec, type ReviewScope } from "./git.js";
+import { parseReviewOutput } from "./review-output.js";
 import {
   runAgy,
   defaultDeps,
@@ -26,6 +28,7 @@ import {
   resolveSessionTransfer,
   parseImageGenReply,
   mimeTypeFor,
+  buildGitReviewPrompt,
   type ToolDef,
 } from "./tools.js";
 import {
@@ -40,6 +43,13 @@ import {
 type TextBlock = { type: "text"; text: string };
 type ImageBlock = { type: "image"; data: string; mimeType: string };
 type ContentBlock = TextBlock | ImageBlock;
+
+/**
+ * Default GitExec for review tools: wraps the real `git` binary via
+ * execWithClosedStdin. Injectable through createToolHandler so the git
+ * collection path is unit-testable without a repo.
+ */
+const defaultGitExecExecFn: GitExec = defaultGitExec(execWithClosedStdin);
 
 interface ToolResponse {
   [key: string]: unknown;
@@ -89,12 +99,12 @@ export function createToolHandler(
   imageGenDeps: ImageGenDeps = defaultImageGenDeps,
   jobStore: JobStore = defaultJobStore,
   backgroundRunner: BackgroundRunner = defaultBackgroundRunner,
+  gitExec: GitExec = defaultGitExecExecFn,
 ): (args: Record<string, unknown>, extra?: HandlerExtra) => Promise<ToolResponse> {
   return async (args, extra) => {
     try {
       const cwd = (args.cwd as string | undefined) ?? process.cwd();
       const conversationId = args.session_id as string | undefined;
-      const prompt = tool.buildPrompt(args, cwd);
       const timeoutSec =
         cfg.perToolTimeouts[tool.name] ?? (cfg.timeoutExplicit ? cfg.timeoutSec : tool.timeoutSec);
       // Resolve a user-supplied alias ("flash", "opus", ...) to its canonical
@@ -105,6 +115,26 @@ export function createToolHandler(
       // `delegate`; `sandbox` is accepted by the read-only delegators too.
       const sandbox = args.sandbox as boolean | undefined;
       const write = args.write as boolean | undefined;
+
+      // Workstream A: git-aware review. When a review tool is called with no
+      // inline content/files, auto-collect the git diff (working-tree or branch)
+      // and build the prompt from it. `gitReview` marks the run so the response
+      // is parsed for structured findings below.
+      let prompt: string;
+      let gitReview = false;
+      const isReviewTool = tool.name === "adversarial_review" || tool.name === "pre_finish_review";
+      const hasInline =
+        Boolean(args.content) || Boolean((args.files as string[] | undefined)?.length);
+      if (isReviewTool && !hasInline) {
+        const ctx = await collectReviewContext(cwd, gitExec, {
+          scope: args.scope as ReviewScope | undefined,
+          base: args.base as string | undefined,
+        });
+        prompt = buildGitReviewPrompt(ctx, args);
+        gitReview = true;
+      } else {
+        prompt = tool.buildPrompt(args, cwd);
+      }
 
       // Background path: spawn detached, return a job id at once (no await on agy).
       if (args.background === true && BACKGROUND_CAPABLE.has(tool.name)) {
@@ -195,6 +225,30 @@ export function createToolHandler(
 
       if (tool.name === "image_gen") {
         return buildImageGenResponse(result, args, meta, imageGenDeps);
+      }
+
+      // Workstream A: parse the structured JSON block from git-collected
+      // reviews. Prepends a one-line verdict/finding summary so the host gets
+      // an actionable headline; the full prose + JSON remain below unchanged.
+      if (gitReview) {
+        const parsed = parseReviewOutput(result.output);
+        if (parsed.parsed) {
+          const p = parsed.parsed;
+          const sevCounts = p.findings.reduce<Record<string, number>>((acc, f) => {
+            const s = String(f.severity ?? "unknown");
+            acc[s] = (acc[s] ?? 0) + 1;
+            return acc;
+          }, {});
+          const countsStr = Object.entries(sevCounts)
+            .map(([sev, n]) => `${sev}: ${n}`)
+            .join(", ");
+          meta.unshift(
+            `verdict: ${p.verdict ?? "?"}`,
+            `findings: ${p.findings.length} (${countsStr})`,
+          );
+        } else if (parsed.parseError) {
+          meta.push(`structured parse: ${parsed.parseError}`);
+        }
       }
 
       return {

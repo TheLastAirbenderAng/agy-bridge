@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "schemas",
     "CLAUDE.md",
     "SKILL.md",
     "README.md",

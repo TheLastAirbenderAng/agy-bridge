@@ -68,6 +68,7 @@ function handlerFor(
   f: ReturnType<typeof fakeDeps>,
   overrides: Partial<Config> = {},
   cooldowns = new CooldownRegistry(),
+  gitExec?: (args: string[], opts: { cwd: string; maxBuffer?: number }) => Promise<unknown>,
 ) {
   return createToolHandler(
     TOOLS.find((t) => t.name === name)!,
@@ -75,8 +76,43 @@ function handlerFor(
     new ModelRegistry(async () => LISTING),
     f.deps,
     cooldowns,
+    undefined, // imageGenDeps
+    undefined, // jobStore
+    undefined, // backgroundRunner
+    gitExec as never,
   );
 }
+
+/** A gitExec stub that always reports "not a git repository". */
+const notARepoGit = async () => ({ stdout: "", stderr: "not a repo", status: 1 });
+
+/** A gitExec stub returning a trivial working-tree review context. */
+const fakeRepoGit = async (args: string[]) => {
+  // Match on the joined arg string; prefer the longest table key that is a
+  // prefix of the actual args (so `diff --cached --binary ...` matches the
+  // `diff --cached --binary --no-ext-diff --submodule=diff` entry, while a
+  // bare `diff --name-only` matches its own entry).
+  const joined = args.join(" ");
+  const table: Record<string, { stdout: string; stderr: string; status: number }> = {
+    "rev-parse --show-toplevel": { stdout: "/repo", stderr: "", status: 0 },
+    "branch --show-current": { stdout: "main", stderr: "", status: 0 },
+    "diff --cached --name-only": { stdout: "a.ts", stderr: "", status: 0 },
+    "diff --name-only": { stdout: "", stderr: "", status: 0 },
+    "ls-files --others --exclude-standard": { stdout: "", stderr: "", status: 0 },
+    "status --short --untracked-files=all": { stdout: "M  a.ts", stderr: "", status: 0 },
+    "diff --cached --binary --no-ext-diff --submodule=diff": {
+      stdout: "STAGED DIFF",
+      stderr: "",
+      status: 0,
+    },
+    "diff --binary --no-ext-diff --submodule=diff": { stdout: "", stderr: "", status: 0 },
+  };
+  const keys = Object.keys(table).sort((a, b) => b.length - a.length);
+  for (const k of keys) {
+    if (joined.startsWith(k)) return table[k];
+  }
+  return { stdout: "", stderr: "", status: 0 };
+};
 
 describe("createToolHandler", () => {
   it("runs delegate and appends model + session footer", async () => {
@@ -209,10 +245,25 @@ describe("createToolHandler", () => {
     expect(text).toContain("model:");
   });
 
-  it("pre_finish_review errors when neither content nor files is given", async () => {
+  it("pre_finish_review with no content/files errors via git when not a repo", async () => {
+    // New behavior (Workstream A): no content/files → attempt git collection.
+    // Inject a gitExec that reports "not a repo" so it surfaces as an error
+    // rather than touching the real filesystem.
     const f = fakeDeps();
-    const res = await handlerFor("pre_finish_review", f)({});
+    const res = await handlerFor("pre_finish_review", f, {}, undefined, notARepoGit)({});
     expect(res.isError).toBe(true);
-    expect((res.content[0] as { text: string }).text).toMatch(/content.*files/i);
+    expect((res.content[0] as { text: string }).text).toMatch(/Git repository/i);
+  });
+
+  it("pre_finish_review with no content/files auto-reviews the git diff", async () => {
+    const f = fakeDeps();
+    const res = await handlerFor("pre_finish_review", f, {}, undefined, fakeRepoGit)({});
+    expect(res.isError).toBeFalsy();
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toContain("the answer");
+    // The prompt sent to agy should carry the collected diff + the JSON instruction.
+    const prompt = f.runs[0].args[f.runs[0].args.indexOf("-p") + 1];
+    expect(prompt).toContain("STAGED DIFF");
+    expect(prompt).toContain("verdict");
   });
 });
