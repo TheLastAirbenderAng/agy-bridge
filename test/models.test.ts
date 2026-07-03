@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { parseModels, ModelRegistry } from "../src/models.js";
+import {
+  parseModels,
+  ModelRegistry,
+  resolveModelAlias,
+  UnknownModelAliasError,
+  CANONICAL_MODELS,
+} from "../src/models.js";
 
 const LISTING = `Gemini 3.5 Flash (Medium)
 Gemini 3.5 Flash (High)
@@ -19,6 +25,60 @@ describe("parseModels", () => {
     expect(parseModels("Claude Opus 4.6 (Thinking) (current)\n")).toEqual([
       "Claude Opus 4.6 (Thinking)",
     ]);
+  });
+});
+
+describe("resolveModelAlias", () => {
+  it("returns undefined for empty/whitespace/null input (let agy pick)", () => {
+    expect(resolveModelAlias(undefined)).toBeUndefined();
+    expect(resolveModelAlias(null)).toBeUndefined();
+    expect(resolveModelAlias("")).toBeUndefined();
+    expect(resolveModelAlias("   ")).toBeUndefined();
+  });
+
+  it("passes canonical strings through unchanged", () => {
+    for (const m of CANONICAL_MODELS) {
+      expect(resolveModelAlias(m)).toBe(m);
+    }
+  });
+
+  it("resolves the agy-run.sh alias table case-insensitively", () => {
+    expect(resolveModelAlias("flash-low")).toBe("Gemini 3.5 Flash (Low)");
+    expect(resolveModelAlias("flash-medium")).toBe("Gemini 3.5 Flash (Medium)");
+    expect(resolveModelAlias("flash-med")).toBe("Gemini 3.5 Flash (Medium)");
+    expect(resolveModelAlias("flash")).toBe("Gemini 3.5 Flash (High)");
+    expect(resolveModelAlias("flash-high")).toBe("Gemini 3.5 Flash (High)");
+    expect(resolveModelAlias("pro-low")).toBe("Gemini 3.1 Pro (Low)");
+    expect(resolveModelAlias("pro")).toBe("Gemini 3.1 Pro (High)");
+    expect(resolveModelAlias("pro-high")).toBe("Gemini 3.1 Pro (High)");
+    expect(resolveModelAlias("sonnet")).toBe("Claude Sonnet 4.6 (Thinking)");
+    expect(resolveModelAlias("claude-sonnet")).toBe("Claude Sonnet 4.6 (Thinking)");
+    expect(resolveModelAlias("opus")).toBe("Claude Opus 4.6 (Thinking)");
+    expect(resolveModelAlias("claude-opus")).toBe("Claude Opus 4.6 (Thinking)");
+    expect(resolveModelAlias("gpt-oss")).toBe("GPT-OSS 120B (Medium)");
+    expect(resolveModelAlias("gpt-oss-120b")).toBe("GPT-OSS 120B (Medium)");
+  });
+
+  it("is case-insensitive on aliases", () => {
+    expect(resolveModelAlias("FLASH")).toBe("Gemini 3.5 Flash (High)");
+    expect(resolveModelAlias("Opus")).toBe("Claude Opus 4.6 (Thinking)");
+    expect(resolveModelAlias("  pro-low  ")).toBe("Gemini 3.1 Pro (Low)");
+  });
+
+  it("throws UnknownModelAliasError listing valid aliases on a typo", () => {
+    try {
+      resolveModelAlias("flahs");
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(UnknownModelAliasError);
+      expect((e as Error).message).toContain("flahs");
+      // Lists the alias table so the caller can self-correct
+      expect((e as Error).message).toContain("flash");
+    }
+  });
+
+  it("does not accept a partial canonical string as an alias", () => {
+    expect(() => resolveModelAlias("Gemini 3.5 Flash")).toThrow(UnknownModelAliasError);
   });
 });
 

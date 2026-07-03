@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Config } from "./config.js";
 import { detectQuota, QuotaError } from "./quota.js";
+import { AgyRunError, classifyAgyError } from "./errors.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -18,6 +19,18 @@ export interface RunRequest {
   timeoutSec?: number;
   /** MCP cancellation signal — kills the agy process when aborted. */
   signal?: AbortSignal;
+  /**
+   * Per-call sandbox override. When set, wins over cfg.sandbox. `write`
+   * (below) is a higher-level shorthand: write=true forces sandbox OFF (and
+   * --dangerously-skip-permissions ON); write=false forces sandbox ON.
+   */
+  sandbox?: boolean;
+  /**
+   * Per-call write-capability shorthand. write=true → no sandbox, permissions
+   * skipped (agy may edit files). write=false → sandbox forced on (read-only).
+   * Undefined → defer to cfg.sandbox / the explicit `sandbox` field.
+   */
+  write?: boolean;
 }
 
 export interface RunResult {
@@ -206,9 +219,28 @@ export const defaultDeps: RunnerDeps = {
 
 export function buildArgs(req: RunRequest, cfg: Config, logPath: string): string[] {
   const timeoutSec = req.timeoutSec ?? cfg.timeoutSec;
+
+  // Resolve per-call sandbox/permission policy. Precedence:
+  //   explicit req.sandbox  >  req.write shorthand  >  cfg defaults.
+  // `write: true` is a strong signal: drop the sandbox AND force
+  // --dangerously-skip-permissions on (a write run that stops to prompt would
+  // hang in headless mode). `write: false` forces the sandbox on for safety.
+  let sandbox: boolean;
+  let skipPermissions: boolean;
+  if (req.sandbox !== undefined) {
+    sandbox = req.sandbox;
+    skipPermissions = cfg.skipPermissions;
+  } else if (req.write !== undefined) {
+    sandbox = !req.write;
+    skipPermissions = req.write ? true : cfg.skipPermissions;
+  } else {
+    sandbox = cfg.sandbox;
+    skipPermissions = cfg.skipPermissions;
+  }
+
   const args: string[] = [];
-  if (cfg.skipPermissions) args.push("--dangerously-skip-permissions");
-  if (cfg.sandbox) args.push("--sandbox");
+  if (skipPermissions) args.push("--dangerously-skip-permissions");
+  if (sandbox) args.push("--sandbox");
   args.push("--add-dir", req.cwd);
   args.push("--log-file", logPath);
   if (req.conversationId) args.push("--conversation", req.conversationId);
@@ -304,14 +336,10 @@ export async function runAgy(
     void child.wait().then(async ({ code, error }) => {
       if (settled) return;
       if (error?.code === "ENOENT") {
-        finish(() =>
-          reject(
-            new Error(
-              `agy CLI not found at "${cfg.agyPath}". Install the Antigravity CLI ` +
-                `(https://antigravity.google/docs/cli-getting-started) or set AGY_PATH.`,
-            ),
-          ),
-        );
+        // classifyAgyError recognizes ENOENT and returns the install-guidance
+        // message; route through it so the host sees a `not-installed` kind.
+        const c = classifyAgyError({ spawnError: error });
+        finish(() => reject(new AgyRunError(c, req.model)));
         return;
       }
       if (error) {
@@ -319,26 +347,29 @@ export async function runAgy(
         return;
       }
       const out = child.stdout().trim();
+      const stderr = child.stderr().trim();
       if (code !== 0) {
-        const stderr = child.stderr().trim();
-        finish(() =>
-          reject(new Error(stderr ? `agy failed: ${stderr}` : `agy exited with code ${code}.`)),
-        );
+        const log = await deps.readLog(logPath);
+        const quota = detectQuota(log);
+        if (quota) {
+          finish(() => reject(new QuotaError(req.model, quota)));
+          return;
+        }
+        const c = classifyAgyError({ stdout: out, stderr, log, exitCode: code });
+        finish(() => reject(new AgyRunError(c, req.model)));
         return;
       }
       if (!out) {
-        // agy swallows quota errors and exits 0 with empty output after its
+        // agy swallows quota/geo errors and exits 0 with empty output after its
         // print-timeout — check the log before reporting anything as success.
-        const quota = detectQuota(await deps.readLog(logPath));
-        finish(() =>
-          reject(
-            quota
-              ? new QuotaError(req.model, quota)
-              : new Error(
-                  "agy returned empty output (likely hit its print-timeout without a response).",
-                ),
-          ),
-        );
+        const log = await deps.readLog(logPath);
+        const quota = detectQuota(log);
+        if (quota) {
+          finish(() => reject(new QuotaError(req.model, quota)));
+          return;
+        }
+        const c = classifyAgyError({ stdout: out, stderr, log, exitCode: code });
+        finish(() => reject(new AgyRunError(c, req.model)));
         return;
       }
       finish(() => resolve(out));

@@ -9,6 +9,7 @@ import {
   type RunnerDeps,
 } from "../src/runner.js";
 import { QuotaError } from "../src/quota.js";
+import { AgyRunError } from "../src/errors.js";
 import type { Config } from "../src/config.js";
 
 const cfg: Config = {
@@ -26,6 +27,14 @@ const cfg: Config = {
 const LOG_429 =
   "E0613 log.go:398] agent executor error: RESOURCE_EXHAUSTED (code 429): " +
   "Individual quota reached. Resets in 4h24m.";
+
+// Verified live (LEARNINGS.md §4): agy exits 0 with empty stdout on a geo-block.
+const GEO_BLOCK_LOG =
+  "I0703 server_oauth.go: OAuth: authenticated successfully as user@example.com\n" +
+  "I0703 printmode.go: Print mode: sending message\n" +
+  "E0703 log.go: agent executor error: FAILED_PRECONDITION (code 400): " +
+  "User location is not supported for the API use.\n" +
+  "I0703 printmode.go: PlannerResponse without ModifiedResponse encountered";
 
 interface FakeOpts {
   stdout?: string;
@@ -118,6 +127,47 @@ describe("buildArgs", () => {
       "-p",
       "q",
     ]);
+  });
+
+  it("write=true drops sandbox and forces --dangerously-skip-permissions on", () => {
+    // Even with cfg.sandbox=true and cfg.skipPermissions=false, a write request
+    // must run unsandboxed with permissions skipped (else it hangs on prompts).
+    const args = buildArgs(
+      { prompt: "edit it", cwd: "/repo", write: true },
+      { ...cfg, sandbox: true, skipPermissions: false },
+      "/tmp/run.log",
+    );
+    expect(args).toContain("--dangerously-skip-permissions");
+    expect(args).not.toContain("--sandbox");
+  });
+
+  it("write=false forces --sandbox on for safety", () => {
+    const args = buildArgs(
+      { prompt: "look only", cwd: "/repo", write: false },
+      { ...cfg, sandbox: false, skipPermissions: true },
+      "/tmp/run.log",
+    );
+    expect(args).toContain("--sandbox");
+    expect(args).toContain("--dangerously-skip-permissions"); // follows cfg
+  });
+
+  it("explicit sandbox overrides the write shorthand", () => {
+    // sandbox=true wins even though write=true would otherwise drop it.
+    const args = buildArgs(
+      { prompt: "q", cwd: "/repo", write: true, sandbox: true },
+      { ...cfg, sandbox: false, skipPermissions: false },
+      "/tmp/run.log",
+    );
+    expect(args).toContain("--sandbox");
+  });
+
+  it("explicit sandbox=false overrides cfg.sandbox=true", () => {
+    const args = buildArgs(
+      { prompt: "q", cwd: "/repo", sandbox: false },
+      { ...cfg, sandbox: true },
+      "/tmp/run.log",
+    );
+    expect(args).not.toContain("--sandbox");
   });
 });
 
@@ -222,11 +272,24 @@ describe("runAgy", () => {
     );
   });
 
-  it("treats empty output with a clean log as an error, not success", async () => {
+  it("treats empty output with a clean log as an AgyRunError(unknown), not success", async () => {
     const f = fakeDeps({ stdout: "", exitCode: 0 });
-    await expect(runAgy({ prompt: "q", cwd: "/repo" }, cfg, f.deps)).rejects.toThrow(
-      /empty output/i,
-    );
+    const err = (await runAgy({ prompt: "q", cwd: "/repo" }, cfg, f.deps).catch(
+      (e) => e,
+    )) as AgyRunError;
+    expect(err).toBeInstanceOf(AgyRunError);
+    expect(err.kind).toBe("unknown");
+    expect(err.message).toMatch(/no usable output/i);
+  });
+
+  it("classifies an empty-output geo-block log as geo-blocked", async () => {
+    const f = fakeDeps({ stdout: "", exitCode: 0, log: GEO_BLOCK_LOG });
+    const err = (await runAgy({ prompt: "q", cwd: "/repo" }, cfg, f.deps).catch(
+      (e) => e,
+    )) as AgyRunError;
+    expect(err).toBeInstanceOf(AgyRunError);
+    expect(err.kind).toBe("geo-blocked");
+    expect(err.message).toMatch(/location is not supported/i);
   });
 
   it("throws install guidance on ENOENT", async () => {

@@ -49,7 +49,9 @@ const commonShape = {
     .string()
     .optional()
     .describe(
-      'Override the model (exact name from `agy models`, e.g. "Gemini 3.1 Pro (High)"). ' +
+      'Override the model. Accepts a canonical name from `agy models` (e.g. "Gemini 3.1 Pro ' +
+        '(High)") OR a short alias: flash-low, flash-medium, flash-med, flash/flash-high, ' +
+        "pro-low, pro/pro-high, sonnet, claude-sonnet, opus, claude-opus, gpt-oss, gpt-oss-120b. " +
         "Normally omit — the tool routes automatically.",
     ),
 };
@@ -68,6 +70,37 @@ const backgroundShape = {
       "If true, run this task in the background and return a {job_id} immediately instead of " +
         "awaiting the result. Poll with job_status / job_result; cancel with job_cancel. " +
         "Default false (synchronous — current behavior).",
+    ),
+};
+
+/**
+ * Per-call sandbox override. Accepted by every tool that spawns agy. When set,
+ * wins over the AGY_SANDBOX global. Use true to keep agy read-only (no shell,
+ * no writes) even when delegating a task you'd otherwise let roam.
+ */
+const sandboxShape = {
+  sandbox: z
+    .boolean()
+    .optional()
+    .describe(
+      "Force agy's --sandbox on (true) or off (false) for this call, overriding AGY_SANDBOX. " +
+        "Sandbox = read-only: agy can read files but cannot run shell commands or write.",
+    ),
+};
+
+/**
+ * Per-call write-capability shorthand for `delegate`. write=true drops the
+ * sandbox AND enables --dangerously-skip-permissions so agy may edit files in
+ * the cwd (a write run that stops to prompt would hang in headless mode).
+ * write=false forces the sandbox on for safety.
+ */
+const writeShape = {
+  write: z
+    .boolean()
+    .optional()
+    .describe(
+      "Only for delegate. true = agy may edit files (sandbox off, permissions auto-approved). " +
+        "false = read-only (sandbox on). Default follows AGY_SANDBOX / the explicit `sandbox` arg.",
     ),
 };
 
@@ -105,6 +138,7 @@ export const TOOLS: ToolDef[] = [
       question: z.string().describe("What you want to know about these files."),
       ...commonShape,
       ...backgroundShape,
+      ...sandboxShape,
     },
     chain: ["Gemini 3.5 Flash (High)", "Gemini 3.1 Pro (Low)"],
     timeoutSec: 300,
@@ -128,6 +162,7 @@ export const TOOLS: ToolDef[] = [
         .describe("What to find, e.g. 'when was the auth middleware refactored and why'."),
       ...commonShape,
       ...backgroundShape,
+      ...sandboxShape,
     },
     chain: ["Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (High)"],
     timeoutSec: 180,
@@ -149,6 +184,7 @@ export const TOOLS: ToolDef[] = [
       query: z.string().describe("What to look up on the web."),
       ...commonShape,
       ...backgroundShape,
+      ...sandboxShape,
     },
     chain: ["Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (High)"],
     timeoutSec: 120,
@@ -173,6 +209,7 @@ export const TOOLS: ToolDef[] = [
         .describe("File paths to review instead of inline content."),
       focus: z.string().optional().describe("Optional focus area, e.g. 'security', 'concurrency'."),
       ...commonShape,
+      ...sandboxShape,
     },
     chain: ["Gemini 3.1 Pro (High)", "Claude Opus 4.6 (Thinking)", "Gemini 3.5 Flash (High)"],
     timeoutSec: 300,
@@ -199,6 +236,7 @@ export const TOOLS: ToolDef[] = [
         .describe("File paths to review instead of inline content."),
       focus: z.string().optional().describe("Optional focus area, e.g. 'security', 'concurrency'."),
       ...commonShape,
+      ...sandboxShape,
     },
     chain: ["Gemini 3.1 Pro (High)", "Claude Opus 4.6 (Thinking)", "Gemini 3.5 Flash (High)"],
     timeoutSec: 300,
@@ -230,6 +268,8 @@ export const TOOLS: ToolDef[] = [
       prompt: z.string().describe("The complete task prompt for agy."),
       ...commonShape,
       ...backgroundShape,
+      ...sandboxShape,
+      ...writeShape,
     },
     chain: ["Gemini 3.5 Flash (High)"],
     timeoutSec: 600,

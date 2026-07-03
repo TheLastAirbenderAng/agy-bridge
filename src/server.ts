@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { loadConfig, type Config } from "./config.js";
-import { ModelRegistry } from "./models.js";
+import { ModelRegistry, resolveModelAlias } from "./models.js";
 import {
   runAgy,
   defaultDeps,
@@ -18,6 +18,7 @@ import {
   defaultTreeKillExec,
 } from "./runner.js";
 import { CooldownRegistry, QuotaError } from "./quota.js";
+import { AgyRunError } from "./errors.js";
 import {
   TOOLS,
   SESSION_TRANSFER_TOOL,
@@ -96,11 +97,19 @@ export function createToolHandler(
       const prompt = tool.buildPrompt(args, cwd);
       const timeoutSec =
         cfg.perToolTimeouts[tool.name] ?? (cfg.timeoutExplicit ? cfg.timeoutSec : tool.timeoutSec);
+      // Resolve a user-supplied alias ("flash", "opus", ...) to its canonical
+      // agy model string. Passes canonical strings and undefined through;
+      // throws UnknownModelAliasError on a typo (surfaced as isError below).
+      const explicitModel = resolveModelAlias(args.model as string | undefined);
+      // Per-call sandbox/write shorthand (Workstream C). `write` only exists on
+      // `delegate`; `sandbox` is accepted by the read-only delegators too.
+      const sandbox = args.sandbox as boolean | undefined;
+      const write = args.write as boolean | undefined;
 
       // Background path: spawn detached, return a job id at once (no await on agy).
       if (args.background === true && BACKGROUND_CAPABLE.has(tool.name)) {
         const jobId = await backgroundRunner(
-          { prompt, cwd, model: args.model as string | undefined, conversationId, timeoutSec },
+          { prompt, cwd, model: explicitModel, conversationId, timeoutSec, sandbox, write },
           cfg,
           deps,
           jobStore,
@@ -128,7 +137,7 @@ export function createToolHandler(
       const resolution = conversationId
         ? { models: [undefined], note: undefined }
         : await registry.resolveChain({
-            explicit: args.model as string | undefined,
+            explicit: explicitModel,
             chain: tool.chain,
             defaultModel: cfg.defaultModel,
           });
@@ -144,7 +153,16 @@ export function createToolHandler(
         }
         try {
           result = await runAgy(
-            { prompt, cwd, model, conversationId, timeoutSec, signal: extra?.signal },
+            {
+              prompt,
+              cwd,
+              model,
+              conversationId,
+              timeoutSec,
+              signal: extra?.signal,
+              sandbox,
+              write,
+            },
             cfg,
             deps,
           );
@@ -186,6 +204,12 @@ export function createToolHandler(
       };
     } catch (err) {
       let text = (err as Error).message;
+      // Surface the structured error kind (geo-blocked / rate-limit / auth /
+      // safety / not-installed) as a footer so the host model gets an
+      // actionable signal instead of guessing from raw text.
+      if (err instanceof AgyRunError) {
+        text += `\n\n[agy-bridge error kind: ${err.kind}]`;
+      }
       if (cfg.onFailure === "strict") {
         text +=
           "\n\n[agy-bridge strict mode] Delegation failed. Do NOT perform this work yourself " +
