@@ -10,6 +10,7 @@ import { collectReviewContext, defaultGitExec, type GitExec, type ReviewScope } 
 import { parseReviewOutput } from "./review-output.js";
 import { extractDelta } from "./delta.js";
 import { defaultSessionStore, type SessionStore } from "./session-store.js";
+import { sniffImageFormat } from "./sniff.js";
 import {
   runAgy,
   defaultDeps,
@@ -351,10 +352,21 @@ export async function buildImageGenResponse(
     }
     try {
       const bytes = await deps.readFileBytes(parsed.srcPath);
+      // Sniff the real byte format — agy returns JPEG regardless of the
+      // requested extension (oh-my-agent finding). Trust bytes over the path
+      // extension so a vision host decodes the block correctly.
+      const sniffed = sniffImageFormat(bytes);
+      const mime = sniffed.ext === "bin" ? mimeTypeFor(parsed.srcPath) : sniffed.mime;
+      if (sniffed.ext !== "bin") {
+        const pathExt = parsed.srcPath.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] ?? "";
+        if (sniffed.ext !== pathExt) {
+          footer.push(`format sniff: bytes are ${sniffed.ext} (path says ${pathExt || "?"})`);
+        }
+      }
       content.push({
         type: "image",
         data: bytes.toString("base64"),
-        mimeType: mimeTypeFor(parsed.srcPath),
+        mimeType: mime,
       });
     } catch {
       footer.push("image block skipped: file unreadable");
