@@ -338,6 +338,41 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: "agy_look",
+    description:
+      "Look at one or more EXISTING images and answer questions about them by delegating to a " +
+      "vision-capable Antigravity model (Gemini). USE THIS when the host agent cannot see images " +
+      "(e.g. a text-only model) and needs to understand a screenshot, diagram, chart, photo, UI " +
+      "mockup, or error dialog — pass the file path(s) and what you want to know, and only the " +
+      "answer enters the host's context. Distinct from image_gen (which GENERATES images) and " +
+      "analyze_files (which reads TEXT/code). Uses agy's @<path> file-attachment convention.",
+    schema: {
+      image_path: z
+        .union([z.string(), z.array(z.string()).min(1)])
+        .describe(
+          "Absolute or cwd-relative path(s) to the image(s) to inspect. PNG, JPEG, WEBP, GIF.",
+        ),
+      question: z
+        .string()
+        .describe(
+          "What you want to know about the image(s), e.g. 'describe this UI' or 'read the error'.",
+        ),
+      ...commonShape,
+      ...sandboxShape,
+    },
+    chain: ["Gemini 3.5 Flash (High)", "Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (Medium)"],
+    timeoutSec: 180,
+    buildPrompt(args, cwd) {
+      const raw = args.image_path as string | string[];
+      const paths = (Array.isArray(raw) ? raw : [raw]).map((f) => resolveFiles([f], cwd)[0]);
+      const attach = paths.map((p) => `@${p}`).join(" ");
+      return (
+        `Look at the attached image(s) and answer the question. Be precise and concrete; cite "image 1", ` +
+        `"image 2", etc. when there are several. ${OUTPUT_RULES}\n\nImages: ${attach}\n\nQuestion: ${args.question}`
+      );
+    },
+  },
+  {
     name: "image_gen",
     description:
       "Generate an image via the Antigravity CLI's built-in generate_image tool (Imagen). " +

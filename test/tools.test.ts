@@ -3,9 +3,10 @@ import path from "node:path";
 import { TOOLS, resolveFiles, SESSION_TRANSFER_TOOL } from "../src/tools.js";
 
 describe("TOOLS", () => {
-  it("defines the eight runAgy tools", () => {
+  it("defines the nine runAgy tools", () => {
     expect(TOOLS.map((t) => t.name).sort()).toEqual([
       "adversarial_review",
+      "agy_look",
       "analyze_files",
       "deep_search",
       "delegate",
@@ -97,5 +98,25 @@ describe("prompt templates", () => {
 
   it("delegate passes the prompt through verbatim", () => {
     expect(get("delegate").buildPrompt({ prompt: "do x" }, "/repo")).toBe("do x");
+  });
+
+  it("agy_look attaches a single image via the @path convention and embeds the question", () => {
+    const p = get("agy_look").buildPrompt(
+      { image_path: "ui.png", question: "describe this UI" },
+      "/repo",
+    );
+    expect(p).toContain(`@${path.resolve("/repo", "ui.png")}`);
+    expect(p).toContain("describe this UI");
+    expect(p).toMatch(/file:line|precise|image/i);
+  });
+
+  it("agy_look accepts multiple image paths and labels them by index", () => {
+    const p = get("agy_look").buildPrompt(
+      { image_path: ["a.png", "/abs/b.jpg"], question: "compare" },
+      "/repo",
+    );
+    expect(p).toContain(`@${path.resolve("/repo", "a.png")}`);
+    expect(p).toContain("@/abs/b.jpg");
+    expect(p).toMatch(/image 1|image 2/i);
   });
 });
