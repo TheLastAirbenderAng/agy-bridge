@@ -33,14 +33,14 @@ User → Claude Code → agy-bridge (MCP) → agy CLI → Gemini / Claude / GPT-
 
 ## Why this over claude-to-agy?
 
-|                 | claude-to-agy               | **agy-bridge**                                                                       |
-| --------------- | --------------------------- | ------------------------------------------------------------------------------------ |
-| Tool surface    | 1 generic `delegate_to_agy` | 6 purpose-built tools — Claude self-routes reliably                                  |
-| Model selection | none (agy default only)     | per-tool routing across all `agy models`, with availability detection and fallback   |
-| Multi-turn      | stateless                   | session continuity — `follow_up` resumes agy conversations without resending context |
-| Output safety   | unbounded                   | configurable truncation cap protects Claude's context                                |
-| Sandbox         | no                          | optional `--sandbox` mode                                                            |
-| Install         | uvx (Python)                | npx (Node) — zero install                                                            |
+|                 | claude-to-agy               | **agy-bridge**                                                                                                  |
+| --------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Tool surface    | 1 generic `delegate_to_agy` | 9 purpose-built delegation tools + lifecycle tools — agents self-route reliably                                 |
+| Model selection | none (agy default only)     | per-tool routing across all `agy models` + short aliases, with availability detection and fallback              |
+| Multi-turn      | stateless                   | session continuity — `follow_up` resumes agy conversations without resending context, persisted across restarts |
+| Output safety   | unbounded                   | configurable truncation cap protects the host's context                                                         |
+| Sandbox         | no                          | optional `--sandbox`, plus per-call `sandbox`/`write` overrides                                                 |
+| Install         | uvx (Python)                | npx (Node) — zero install                                                                                       |
 
 ## Requirements
 
@@ -70,16 +70,24 @@ response` while the agy run is still going. If your client doesn't honor a
 
 ## Tools
 
-| Tool                 | Use for                                                         | Model routing (first available)                                   |
-| -------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `analyze_files`      | Files >200 lines, >3 files at once, logs, dumps, generated code | Gemini 3.5 Flash (High) → Gemini 3.1 Pro (Low)                    |
-| `deep_search`        | git log/diff/blame archaeology, repo-wide greps                 | Gemini 3.5 Flash (Medium) → (High)                                |
-| `web_lookup`         | Docs, API references, external/current knowledge                | Gemini 3.5 Flash (Medium) → (High)                                |
-| `adversarial_review` | Plan critiques, design and code reviews                         | Gemini 3.1 Pro (High) → Claude Opus 4.6 (Thinking) → Flash (High) |
-| `follow_up`          | Continue a prior session by `session_id` — no context resend    | inherits the session                                              |
-| `delegate`           | Anything else heavy                                             | Gemini 3.5 Flash (High)                                           |
+| Tool                 | Use for                                                                        | Model routing (first available)                                   |
+| -------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| `analyze_files`      | Files >200 lines, >3 files at once, logs, dumps, generated code                | Gemini 3.5 Flash (High) → Gemini 3.1 Pro (Low)                    |
+| `agy_look`           | Look at EXISTING images (screenshots, diagrams, UI) — for hosts without vision | Gemini 3.5 Flash (High) → Gemini 3.1 Pro (High) → Flash (Medium)  |
+| `deep_search`        | git log/diff/blame archaeology, repo-wide greps                                | Gemini 3.5 Flash (Medium) → (High)                                |
+| `web_lookup`         | Docs, API references, external/current knowledge                               | Gemini 3.5 Flash (Medium) → (High)                                |
+| `adversarial_review` | Plan critiques, design and code reviews; auto-collects git diff                | Gemini 3.1 Pro (High) → Claude Opus 4.6 (Thinking) → Flash (High) |
+| `pre_finish_review`  | Adversarial WIP review before declaring a task done                            | Gemini 3.1 Pro (High) → Claude Opus 4.6 (Thinking) → Flash (High) |
+| `follow_up`          | Continue a prior session (omit `session_id` to resume latest)                  | inherits the session                                              |
+| `image_gen`          | Generate an image via agy's generate_image (Imagen)                            | Gemini 3.5 Flash (High) → (Medium)                                |
+| `delegate`           | Anything else heavy (pass `write: true` to let agy edit files)                 | Gemini 3.5 Flash (High)                                           |
+| `setup`              | Health check — agy install path, version, auth status                          | n/a (no model call)                                               |
+| `session_transfer`   | Resolve a conversation id and return a resume command                          | n/a (reads agy's sessions cache)                                  |
+| `job_status`         | Poll a background job (pass `wait: true` to block until done)                  | n/a                                                               |
+| `job_result`         | Retrieve a finished background job's output                                    | n/a                                                               |
+| `job_cancel`         | Cancel a running background job                                                | n/a                                                               |
 
-All tools accept optional `cwd` (project root) and `model` (exact name from `agy models`; validated, with available models listed on mismatch).
+All delegating tools accept optional `cwd` (project root), `model` (a canonical name from `agy models` **or a short alias** — see below), and `sandbox` (force `--sandbox` on/off per call). `delegate` additionally accepts `write` (true = agy may edit files).
 
 Every response ends with a footer:
 
@@ -87,6 +95,49 @@ Every response ends with a footer:
 ---
 [agy-bridge] model: Gemini 3.5 Flash (High) | session: 1f0c…-d4 (use follow_up to continue)
 ```
+
+### Model aliases
+
+Instead of the full canonical string (`"Gemini 3.1 Pro (High)"`), every tool's `model` arg accepts a short alias, resolved case-insensitively:
+
+| Alias                       | Canonical                    |
+| --------------------------- | ---------------------------- |
+| `flash-low`                 | Gemini 3.5 Flash (Low)       |
+| `flash-medium`, `flash-med` | Gemini 3.5 Flash (Medium)    |
+| `flash`, `flash-high`       | Gemini 3.5 Flash (High)      |
+| `pro-low`                   | Gemini 3.1 Pro (Low)         |
+| `pro`, `pro-high`           | Gemini 3.1 Pro (High)        |
+| `sonnet`, `claude-sonnet`   | Claude Sonnet 4.6 (Thinking) |
+| `opus`, `claude-opus`       | Claude Opus 4.6 (Thinking)   |
+| `gpt-oss`, `gpt-oss-120b`   | GPT-OSS 120B (Medium)        |
+
+Canonical strings also pass through unchanged. Unknown aliases throw with the table (typo safety).
+
+### Git-aware review + structured output
+
+`adversarial_review` and `pre_finish_review` accept inline `content`/`files` as before, **or** — when neither is passed — auto-collect the relevant git diff. Pass `scope` (`auto`/`working-tree`/`branch`) and an optional `base` ref. In `auto` mode the bridge reviews the working tree when dirty, else the current branch against the detected default branch (`main`/`master`/`trunk`). Large diffs (over ~256 KB) flip to `self-collect` mode: the bridge tells agy to run its own read-only `git diff` rather than inlining the whole diff into the prompt.
+
+Both review tools instruct agy to END its reply with a fenced JSON block conforming to [`schemas/review-output.schema.json`](schemas/review-output.schema.json) (`verdict`, `summary`, severity-ranked `findings[]`, `next_steps`). The bridge parses it and prepends a one-line verdict + finding-count summary to the footer, so the host gets an actionable headline alongside the full prose.
+
+### Vision delegation (`agy_look`)
+
+For a host agent that **cannot see images** (e.g. a text-only model), `agy_look` delegates image _analysis_ to a vision-capable agy model: pass `image_path` (one or many, PNG/JPEG/WEBP/GIF) and a `question`, and only the answer enters the host's context. Distinct from `image_gen` (which _generates_ images) and `analyze_files` (which reads text/code). Uses agy's `@<path>` file-attachment convention.
+
+### Multi-turn continuity
+
+`follow_up` continues a prior session. Pass `session_id` to continue a specific one, **or omit it to resume the most recent session for the cwd** (the bridge persists `{cwd → conversationId, prevOutput}` to `~/.agy-bridge/sessions.json` across server restarts). On each turn agy replays the whole transcript; the bridge extracts only the new turn via 5-stage delta alignment so the host's context stays small.
+
+### Background jobs + status polling
+
+`delegate`, `analyze_files`, `deep_search`, and `web_lookup` accept `background: true` to return a `{job_id}` immediately and run agy detached. Poll with `job_status` — pass `wait: true` (plus optional `timeout_ms`/`poll_ms`) to block until the job finishes. While a job is running, `job_status` includes `partialOutput` (agy's stdout captured so far) as a coarse progress signal. Cancel with `job_cancel`.
+
+### Structured error classification
+
+Failures are classified into a stable `kind` surfaced in the response footer (`[agy-bridge error kind: geo-blocked]`): **geo-blocked** (Google rejected the request due to user location — use a VPN), **rate-limit**, **auth-required**, **safety-refused**, **not-installed**, or **unknown**. The geo-block in particular no longer surfaces as a confusing empty reply.
+
+### Image format sniffing
+
+agy's `generate_image` returns JPEG bytes regardless of the requested extension. `image_gen` sniffs the actual bytes to set the correct MCP mime type on the image content block, and flags in the footer when the bytes disagree with the path extension.
 
 ### Model routing
 
