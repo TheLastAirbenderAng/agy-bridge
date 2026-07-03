@@ -305,11 +305,19 @@ export const TOOLS: ToolDef[] = [
   {
     name: "follow_up",
     description:
-      "Continue a previous Antigravity session by session_id (returned by every other tool). " +
-      "USE THIS for follow-up questions about a prior delegation — the full prior context " +
-      "is already on agy's side, so you don't resend anything.",
+      "Continue a previous Antigravity session. Pass `session_id` (returned by every other tool) " +
+      "to continue a specific session, OR omit it to resume the most recent session for the cwd. " +
+      "USE THIS for follow-up questions about a prior delegation — the full prior context is " +
+      "already on agy's side, so you don't resend anything. The bridge extracts only the new " +
+      "turn from agy's reply (agy replays the whole transcript) so your context stays small.",
     schema: {
-      session_id: z.string().describe("The session id returned by a previous agy-bridge call."),
+      session_id: z
+        .string()
+        .optional()
+        .describe(
+          "The session id returned by a previous agy-bridge call. Omit to resume the latest " +
+            "session for the cwd.",
+        ),
       question: z.string().describe("The follow-up question."),
       ...commonShape,
     },

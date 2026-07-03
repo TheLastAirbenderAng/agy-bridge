@@ -12,6 +12,7 @@ import {
   runAgyBackground,
   cancelJob,
   scanOrphans,
+  waitForJob,
   type JobStoreDeps,
   type JobRecord,
 } from "../src/jobs.js";
@@ -506,5 +507,107 @@ describe("createJobStatusHandler", () => {
     const res = await createJobStatusHandler(store)({ id: "j1" });
     const payload = JSON.parse((res.content[0] as { text: string }).text);
     expect(payload).toMatchObject({ id: "j1", status: "done", startedAt: "2026-01-01T00:00:00Z" });
+  });
+
+  it("surfaces partialOutput for a running job (progress signal)", async () => {
+    const store = createJobStore(
+      memDeps([
+        {
+          id: "jrun",
+          status: "running",
+          cwd: "/r",
+          prompt: "p",
+          startedAt: "t",
+          partialOutput: "agy is thinking...",
+        },
+      ]).deps,
+    );
+    const res = await createJobStatusHandler(store)({ id: "jrun" });
+    const payload = JSON.parse((res.content[0] as { text: string }).text);
+    expect(payload.partialOutput).toBe("agy is thinking...");
+  });
+
+  it("omits partialOutput for a finished job", async () => {
+    const store = createJobStore(
+      memDeps([
+        { id: "jdone", status: "done", cwd: "/r", prompt: "p", startedAt: "t", partialOutput: "x" },
+      ]).deps,
+    );
+    const res = await createJobStatusHandler(store)({ id: "jdone" });
+    const payload = JSON.parse((res.content[0] as { text: string }).text);
+    expect(payload.partialOutput).toBeUndefined();
+  });
+});
+
+describe("waitForJob", () => {
+  it("returns immediately when the job is already finished", async () => {
+    const store = createJobStore(
+      memDeps([{ id: "j1", status: "done", cwd: "/r", prompt: "p", startedAt: "t" }]).deps,
+    );
+    const { job, waitTimedOut } = await waitForJob("j1", store, {
+      sleep: async () => {
+        throw new Error("should not sleep");
+      },
+    });
+    expect(job?.status).toBe("done");
+    expect(waitTimedOut).toBe(false);
+  });
+
+  it("polls until the job transitions to done", async () => {
+    let status: JobRecord["status"] = "running";
+    const records = (): JobRecord[] => [
+      { id: "jp", status, cwd: "/r", prompt: "p", startedAt: "t" },
+    ];
+    const store = createJobStore(memDeps(records()).deps);
+    // After the first poll, flip the in-memory record to done. We simulate by
+    // re-creating the store mid-flight via a custom sleep.
+    let polls = 0;
+    const sleep = async () => {
+      polls++;
+      if (polls === 1) status = "done";
+    };
+    // memDeps reads `content` once at construction; rebuild a store that
+    // re-reads on each get. Simplest: a custom store.
+    const dynamicStore = {
+      load: async () => records(),
+      save: async () => {},
+      get: async (id: string) => (id === "jp" ? records()[0] : undefined),
+      upsert: async () => {},
+    };
+    const { job, waitTimedOut } = await waitForJob("jp", dynamicStore, {
+      pollMs: 1,
+      timeoutMs: 1000,
+      sleep,
+    });
+    expect(polls).toBeGreaterThanOrEqual(1);
+    expect(job?.status).toBe("done");
+    expect(waitTimedOut).toBe(false);
+  });
+
+  it("reports waitTimedOut when the deadline elapses while still running", async () => {
+    const store = createJobStore(
+      memDeps([{ id: "jstuck", status: "running", cwd: "/r", prompt: "p", startedAt: "t" }]).deps,
+    );
+    let clock = 0;
+    const { waitTimedOut } = await waitForJob("jstuck", store, {
+      timeoutMs: 100,
+      pollMs: 10,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      now: () => clock,
+    });
+    expect(waitTimedOut).toBe(true);
+  });
+
+  it("returns job undefined + no timeout for an unknown id", async () => {
+    const store = createJobStore(memDeps([]).deps);
+    const { job, waitTimedOut } = await waitForJob("ghost", store, {
+      sleep: async () => {
+        throw new Error("should not sleep");
+      },
+    });
+    expect(job).toBeUndefined();
+    expect(waitTimedOut).toBe(false);
   });
 });

@@ -24,11 +24,15 @@ import {
 export const JOBS_DIR = path.join(homedir(), ".agy-bridge");
 export const JOBS_FILE = path.join(JOBS_DIR, "jobs.json");
 
-export type JobStatus = "running" | "done" | "failed" | "cancelled";
+export type JobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
+
+export type JobPhase = "queued" | "running" | "done" | "failed" | "cancelled";
 
 export interface JobRecord {
   id: string;
   status: JobStatus;
+  /** Coarse lifecycle phase (mirrors codex tracked-jobs). */
+  phase?: JobPhase;
   pid?: number;
   conversationId?: string;
   cwd: string;
@@ -36,6 +40,17 @@ export interface JobRecord {
   startedAt: string;
   endedAt?: string;
   outputPath?: string;
+  /** Per-job log file path (Workstream B, mirrors codex createJobLogFile). */
+  logFile?: string;
+  /** Human title/summary for display (Workstream B, mirrors codex). */
+  title?: string;
+  summary?: string;
+  /**
+   * Partial stdout captured so far while running (Workstream B). Polling this
+   * via job_status gives the host a progress signal for long agy runs, since
+   * agy -p buffers the full response and emits no event stream.
+   */
+  partialOutput?: string;
   /** agy output text, populated when status becomes `done`. */
   output?: string;
   /** Failure reason, populated when status becomes `failed`. */
@@ -255,4 +270,36 @@ export async function scanOrphans(
   }
   if (fixed > 0) await store.save(records);
   return fixed;
+}
+
+const ACTIVE_STATUSES: ReadonlySet<JobStatus> = new Set(["queued", "running"]);
+
+/**
+ * Poll a job until it leaves the queued/running state, or the deadline elapses.
+ * Mirrors codex-plugin-cc's `waitForSingleJobSnapshot` (`--wait`). Returns the
+ * final record (whatever its status) plus a `waitTimedOut` flag. Pure async
+ * over an injectable store + clock + sleeper, so it's fully unit-testable.
+ */
+export async function waitForJob(
+  id: string,
+  store: JobStore = defaultJobStore,
+  opts: {
+    timeoutMs?: number;
+    pollMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+  } = {},
+): Promise<{ job: JobRecord | undefined; waitTimedOut: boolean }> {
+  const timeoutMs = Math.max(0, opts.timeoutMs ?? 240_000);
+  const pollMs = Math.max(50, opts.pollMs ?? 1000);
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = opts.now ?? Date.now;
+  const deadline = now() + timeoutMs;
+
+  let job = await store.get(id);
+  while (job && ACTIVE_STATUSES.has(job.status) && now() < deadline) {
+    await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
+    job = await store.get(id);
+  }
+  return { job, waitTimedOut: job !== undefined && ACTIVE_STATUSES.has(job.status) };
 }

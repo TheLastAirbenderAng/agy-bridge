@@ -8,6 +8,8 @@ import { loadConfig, type Config } from "./config.js";
 import { ModelRegistry, resolveModelAlias } from "./models.js";
 import { collectReviewContext, defaultGitExec, type GitExec, type ReviewScope } from "./git.js";
 import { parseReviewOutput } from "./review-output.js";
+import { extractDelta } from "./delta.js";
+import { defaultSessionStore, type SessionStore } from "./session-store.js";
 import {
   runAgy,
   defaultDeps,
@@ -35,6 +37,7 @@ import {
   runAgyBackground,
   cancelJob,
   scanOrphans,
+  waitForJob,
   createJobStore,
   defaultJobStore,
   type JobStore,
@@ -100,11 +103,23 @@ export function createToolHandler(
   jobStore: JobStore = defaultJobStore,
   backgroundRunner: BackgroundRunner = defaultBackgroundRunner,
   gitExec: GitExec = defaultGitExecExecFn,
+  sessionStore: SessionStore = defaultSessionStore,
 ): (args: Record<string, unknown>, extra?: HandlerExtra) => Promise<ToolResponse> {
   return async (args, extra) => {
     try {
       const cwd = (args.cwd as string | undefined) ?? process.cwd();
-      const conversationId = args.session_id as string | undefined;
+      // Workstream B: resume-latest. When follow_up is called with no
+      // session_id, resolve the most recent session for this cwd from the
+      // persisted store (mirrors codex --resume-last). Falls back to undefined
+      // (single-turn) when none is recorded.
+      let conversationId = args.session_id as string | undefined;
+      if (!conversationId && tool.name === "follow_up") {
+        const entry = await sessionStore.get(cwd);
+        conversationId = entry?.conversationId;
+      }
+      // For delta extraction on follow_up: capture the prior output before the run.
+      const prevOutputForDelta =
+        tool.name === "follow_up" ? (await sessionStore.get(cwd))?.prevOutput : undefined;
       const timeoutSec =
         cfg.perToolTimeouts[tool.name] ?? (cfg.timeoutExplicit ? cfg.timeoutSec : tool.timeoutSec);
       // Resolve a user-supplied alias ("flash", "opus", ...) to its canonical
@@ -221,17 +236,42 @@ export function createToolHandler(
       const meta: string[] = [`model: ${used ?? "agy default"}`];
       if (resolution.note) meta.push(`note: ${resolution.note}`);
       if (attempts.length) meta.push(`failover: ${attempts.join("; ")}`);
-      if (result.sessionId) meta.push(`session: ${result.sessionId} (use follow_up to continue)`);
+
+      // Workstream B: delta extraction + session persistence for multi-turn.
+      // follow_up replays the whole transcript on agy's side; extract only the
+      // new turn so the host doesn't re-read the entire history. Then persist
+      // {conversationId, output} for the cwd so a restart or a resume-latest
+      // follow_up continues seamlessly. Fire-and-forget the persist so it can't
+      // block the response; failures are swallowed (multi-turn is best-effort).
+      let output = result.output;
+      if (tool.name === "follow_up" && prevOutputForDelta && conversationId) {
+        const delta = extractDelta(prevOutputForDelta, result.output);
+        if (delta) {
+          output = delta;
+          meta.push("delta: extracted new turn only");
+        }
+      }
+      if (result.sessionId) {
+        meta.push(`session: ${result.sessionId} (use follow_up to continue)`);
+        void sessionStore
+          .set(cwd, {
+            conversationId: result.sessionId,
+            prevOutput: output,
+            updatedAt: new Date().toISOString(),
+          })
+          .catch(() => {});
+      }
+      const deltaResult = { ...result, output };
 
       if (tool.name === "image_gen") {
-        return buildImageGenResponse(result, args, meta, imageGenDeps);
+        return buildImageGenResponse(deltaResult, args, meta, imageGenDeps);
       }
 
       // Workstream A: parse the structured JSON block from git-collected
       // reviews. Prepends a one-line verdict/finding summary so the host gets
       // an actionable headline; the full prose + JSON remain below unchanged.
       if (gitReview) {
-        const parsed = parseReviewOutput(result.output);
+        const parsed = parseReviewOutput(deltaResult.output);
         if (parsed.parsed) {
           const p = parsed.parsed;
           const sevCounts = p.findings.reduce<Record<string, number>>((acc, f) => {
@@ -253,7 +293,7 @@ export function createToolHandler(
 
       return {
         content: [
-          { type: "text", text: `${result.output}\n\n---\n[agy-bridge] ${meta.join(" | ")}` },
+          { type: "text", text: `${deltaResult.output}\n\n---\n[agy-bridge] ${meta.join(" | ")}` },
         ],
       };
     } catch (err) {
@@ -433,13 +473,50 @@ export function createSessionTransferHandler(
 
 /**
  * `job_status` — returns a job's status (and timing) by id. Never throws:
- * an unknown id yields an isError response with a clear message.
+ * an unknown id yields an isError response with a clear message. When `wait`
+ * is true, polls until the job leaves queued/running or the timeout elapses
+ * (Workstream B, mirrors codex --wait). Surfaces `partialOutput` while a job
+ * is still running so the host gets a progress signal.
  */
 export function createJobStatusHandler(
   store: JobStore = defaultJobStore,
 ): (args: Record<string, unknown>) => Promise<ToolResponse> {
   return async (args) => {
     const id = args.id as string;
+    if (args.wait === true) {
+      const { job, waitTimedOut } = await waitForJob(id, store, {
+        timeoutMs: (args.timeout_ms as number | undefined) ?? undefined,
+        pollMs: (args.poll_ms as number | undefined) ?? undefined,
+      });
+      if (!job) {
+        return {
+          content: [{ type: "text", text: `Error: unknown job id "${id}".` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                id: job.id,
+                status: job.status,
+                phase: job.phase,
+                startedAt: job.startedAt,
+                endedAt: job.endedAt,
+                waitTimedOut,
+                ...(job.status === "running" && job.partialOutput
+                  ? { partialOutput: job.partialOutput }
+                  : {}),
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
     const job = await store.get(id);
     if (!job) {
       return {
@@ -455,8 +532,12 @@ export function createJobStatusHandler(
             {
               id: job.id,
               status: job.status,
+              phase: job.phase,
               startedAt: job.startedAt,
               endedAt: job.endedAt,
+              ...(job.status === "running" && job.partialOutput
+                ? { partialOutput: job.partialOutput }
+                : {}),
             },
             null,
             2,
@@ -572,10 +653,26 @@ export function createServer(): McpServer {
     "job_status",
     {
       description:
-        "Get the status of a background job (running/done/failed/cancelled) by its job_id. " +
+        "Get the status of a background job (queued/running/done/failed/cancelled) by its job_id. " +
         "Returned immediately by delegate/analyze_files/deep_search/web_lookup when called with " +
-        "background:true. Cheap to poll — does NOT run agy.",
-      inputSchema: jobInputSchema,
+        "background:true. Cheap to poll — does NOT run agy. Pass `wait: true` to block until the " +
+        "job finishes (or `timeout_ms` elapses). While running, includes `partialOutput` — " +
+        "agy's stdout captured so far — as a coarse progress signal.",
+      inputSchema: {
+        ...jobInputSchema,
+        wait: z
+          .boolean()
+          .optional()
+          .describe("If true, block until the job finishes or timeout_ms elapses."),
+        timeout_ms: z
+          .number()
+          .optional()
+          .describe("Max ms to wait when wait=true (default 240000)."),
+        poll_ms: z
+          .number()
+          .optional()
+          .describe("Poll interval in ms when wait=true (default 1000)."),
+      },
     },
     createJobStatusHandler(jobStore),
   );
