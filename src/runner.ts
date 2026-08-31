@@ -151,8 +151,12 @@ export const defaultPidProbe: PidProbe = (pid) => {
   }
 };
 
+export function agySpawnOptions(cwd: string) {
+  return { cwd, detached: true, windowsHide: true };
+}
+
 function spawnDetached(file: string, args: string[], cwd: string): ChildHandle {
-  const child = spawn(file, args, { cwd, detached: true });
+  const child = spawn(file, args, agySpawnOptions(cwd));
   child.stdin?.end();
 
   let out = "";
